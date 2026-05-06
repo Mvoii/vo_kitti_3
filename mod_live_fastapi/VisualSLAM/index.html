@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Live VO Dashboard</title>
+    <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+    <style>
+        body { font-family: sans-serif; margin: 0; padding: 20px; background: #f4f4f9; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }
+        .card { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .header { display: flex; justify-content: space-between; align-items: center; }
+        h1 { color: #333; margin: 0; }
+        button { 
+            padding: 10px 20px; font-size: 16px; font-weight: bold; 
+            background: #007bff; color: white; border: none; 
+            border-radius: 5px; cursor: pointer; transition: 0.2s;
+        }
+        button:hover { background: #0056b3; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        
+        .video-container {
+            width: 100%; aspect-ratio: 1242 / 375; background: #222; 
+            border-radius: 5px; overflow: hidden; display: flex;
+            align-items: center; justify-content: center; color: #777;
+        }
+        .controls { margin-top: 15px; display: flex; gap: 10px; align-items: center; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Real-Time Visual Odometry</h1>
+        <button id="start-btn" onclick="startPipeline()">Start VO Pipeline</button>
+    </div>
+    
+    <!-- Top Section: Video Player -->
+    <div class="card" style="margin-top: 20px;">
+        <h3 style="margin-top: 0;">Camera Feed (image_l)</h3>
+        <div class="video-container">
+            <img id="cam-feed" src="/dataset/image_l/000000.png" style="width: 100%; height: 100%; object-fit: cover;" alt="Awaiting Start...">
+        </div>
+        <div class="controls">
+            <button id="playback-btn" onclick="togglePlayback()" disabled>Play</button>
+            <input type="range" id="frame-slider" min="0" max="0" value="0" style="flex-grow: 1;" oninput="scrubFrame(this.value)" disabled>
+            <span id="frame-counter" style="min-width: 80px; font-weight: bold;">Frame: 0</span>
+        </div>
+    </div>
+
+    <!-- Bottom Section: Map & Errors -->
+    <div class="grid">
+        <div class="card">
+            <h3 style="margin-top: 0;">Trajectory</h3>
+            <div id="trajectory-plot"></div>
+        </div>
+        <div class="card">
+            <h3 style="margin-top: 0;">Error Propagation</h3>
+            <div id="error-plot"></div>
+        </div>
+    </div>
+
+    <script>
+        // Data Storage
+        let isLive = false;
+        let isPlaying = false;
+        let playInterval;
+        let poseHistory = {}; // Store {est_x, est_z} by frame index
+
+        // Initialize Plots
+        Plotly.newPlot('trajectory-plot', [
+            { x: [], y: [], mode: 'lines', name: 'Ground Truth', line: {color: 'blue'} },
+            { x: [], y: [], mode: 'lines', name: 'Estimated', line: {color: 'green'} },
+            { x: [0], y: [0], mode: 'markers', name: 'Camera', marker: {color: 'red', size: 10, symbol: 'circle'} }
+        ], {
+            xaxis: { title: 'X (meters)' }, yaxis: { title: 'Z (meters)', scaleanchor: "x", scaleratio: 1 },
+            margin: { t: 10, b: 40, l: 40, r: 10 }, showlegend: true
+        });
+
+        Plotly.newPlot('error-plot', [{ x: [], y: [], mode: 'lines', name: 'Error', line: {color: 'red'} }], {
+            xaxis: { title: 'Frame' }, yaxis: { title: 'Translation Error (m)' },
+            margin: { t: 10, b: 40, l: 40, r: 10 }
+        });
+
+        // 1. Start Pipeline
+        function startPipeline() {
+            isLive = true;
+            document.getElementById('start-btn').disabled = true;
+            document.getElementById('start-btn').innerText = "Running...";
+            
+            fetch('/start', { method: 'POST' })
+                .catch(err => console.error("Error starting pipeline:", err));
+        }
+
+        // 2. Handle Incoming Data
+        const ws = new WebSocket("ws://localhost:8000/ws");
+        ws.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            
+            if (data.status === "done") {
+                isLive = false;
+                document.getElementById('start-btn').innerText = "Pipeline Complete";
+                document.getElementById('playback-btn').disabled = false;
+                document.getElementById('frame-slider').disabled = false;
+                return;
+            }
+            
+            const frame = data.frame;
+            const gt_x = data.gt_pose[0], gt_z = data.gt_pose[2];
+            const est_x = data.pred_pose[0], est_z = data.pred_pose[2];
+            const error = Math.sqrt(Math.pow(gt_x - est_x, 2) + Math.pow(gt_z - est_z, 2));
+
+            // Save for playback
+            poseHistory[frame] = { est_x, est_z };
+            document.getElementById('frame-slider').max = frame;
+
+            if (isLive) {
+                // Update Lines (Traces 0 & 1)
+                Plotly.extendTraces('trajectory-plot', { x: [[gt_x], [est_x]], y: [[gt_z], [est_z]] }, [0, 1]);
+                // Move Camera Marker (Trace 2)
+                Plotly.animate('trajectory-plot', { data: [{ x: [est_x], y: [est_z] }], traces: [2] }, { transition: {duration: 0}, frame: {duration: 0} });
+                // Update Error
+                Plotly.extendTraces('error-plot', { x: [[frame]], y: [[error]] }, [0]);
+                
+                updateVisuals(frame);
+            }
+        };
+
+        // 3. Playback Controls
+        function togglePlayback() {
+            const btn = document.getElementById('playback-btn');
+            if (isPlaying) {
+                clearInterval(playInterval);
+                btn.innerText = "Play";
+                isPlaying = false;
+            } else {
+                btn.innerText = "Pause";
+                isPlaying = true;
+                playInterval = setInterval(() => {
+                    let slider = document.getElementById('frame-slider');
+                    let nextFrame = parseInt(slider.value) + 1;
+                    if (nextFrame > parseInt(slider.max)) nextFrame = 0; // Loop back
+                    scrubFrame(nextFrame);
+                }, 100); // 10 FPS playback
+            }
+        }
+
+        function scrubFrame(frameIdx) {
+            document.getElementById('frame-slider').value = frameIdx;
+            updateVisuals(frameIdx);
+            
+            // Move the red camera marker to the history point
+            if (poseHistory[frameIdx]) {
+                const pos = poseHistory[frameIdx];
+                Plotly.animate('trajectory-plot', {
+                    data: [{ x: [pos.est_x], y: [pos.est_z] }], traces: [2]
+                }, { transition: {duration: 0}, frame: {duration: 0} });
+            }
+        }
+
+        function updateVisuals(frameIdx) {
+            document.getElementById('frame-counter').innerText = `Frame: ${frameIdx}`;
+            const frameStr = String(frameIdx).padStart(6, '0');
+            document.getElementById('cam-feed').src = `/dataset/image_l/${frameStr}.png?t=${new Date().getTime()}`;
+        }
+    </script>
+</body>
+</html>
